@@ -440,10 +440,14 @@ export default function AdminDashboard() {
     } catch (e) {
       console.error(showLoadingScreen ? 'Admin load error:' : 'Admin background sync error:', e);
       const message = e?.message || '';
-      if (showLoadingScreen || message.includes('Unauthorized')) {
-        setError(message.includes('Unauthorized')
-          ? 'Admin session expired. Please login again.'
-          : 'Failed to load data. Make sure Firestore database is created in Firebase Console.');
+      const unauthorized = e?.status === 401 || /unauthorized/i.test(message);
+      if (unauthorized) {
+        localStorage.removeItem('smcoaa_adminToken');
+        localStorage.removeItem('smcoaa_superToken');
+        setError('Admin session expired. Please sign in again.');
+        navigate('/admin-login', { replace: true });
+      } else if (showLoadingScreen) {
+        setError('Failed to load data. Make sure Firestore database is created in Firebase Console.');
       }
     } finally {
       databaseSyncInProgressRef.current = false;

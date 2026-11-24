@@ -29,6 +29,9 @@ export default function SuperAdminRoute({ children }) {
         if (r.ok) {
           setStatus('ok');
         } else {
+          // A 401 means the underlying Admin session is stale; a 403 means
+          // only the Super Admin session needs to be refreshed.
+          if (r.status === 401) localStorage.removeItem('smcoaa_adminToken');
           localStorage.removeItem('smcoaa_superToken');
           setStatus('denied');
         }

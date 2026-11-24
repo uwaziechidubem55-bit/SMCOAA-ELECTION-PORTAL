@@ -9,6 +9,10 @@ export async function adminApi(action, payload = {}) {
     body: JSON.stringify({ action, ...payload }),
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.message || `Request failed (${res.status})`);
+  if (!res.ok) {
+    const error = new Error(data.message || `Request failed (${res.status})`);
+    error.status = res.status;
+    throw error;
+  }
   return data;
 }

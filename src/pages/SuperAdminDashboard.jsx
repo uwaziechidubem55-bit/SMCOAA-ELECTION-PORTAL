@@ -429,12 +429,11 @@ export default function SuperAdminDashboard() {
     } catch (e) {
       const msg = e?.message || 'Failed to load dashboard';
       setError(msg);
-      if (
-        msg.toLowerCase().includes('super admin session required') ||
-        msg.toLowerCase().includes('unauthorized') ||
-        msg.includes('401') ||
-        msg.includes('403')
-      ) {
+      if (e?.status === 401 || /unauthorized/i.test(msg)) {
+        localStorage.removeItem('smcoaa_adminToken');
+        localStorage.removeItem('smcoaa_superToken');
+        navigate('/admin-login', { replace: true });
+      } else if (e?.status === 403 || /super admin session required/i.test(msg)) {
         localStorage.removeItem('smcoaa_superToken');
         navigate('/super-admin-login', { replace: true });
       }

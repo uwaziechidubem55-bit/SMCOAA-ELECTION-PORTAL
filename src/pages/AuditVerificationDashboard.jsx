@@ -19,7 +19,11 @@ export default function AuditVerificationDashboard() {
       setReport(response.report || null);
     } catch (e) {
       setError(e.message || 'Could not load the verification report.');
-      if (/unauthorized|session required|401|403/i.test(e.message || '')) {
+      if (e?.status === 401 || /unauthorized/i.test(e.message || '')) {
+        localStorage.removeItem('smcoaa_adminToken');
+        localStorage.removeItem('smcoaa_superToken');
+        navigate('/admin-login', { replace: true });
+      } else if (e?.status === 403 || /session required/i.test(e.message || '')) {
         localStorage.removeItem('smcoaa_superToken');
         navigate('/super-admin-login', { replace: true });
       }

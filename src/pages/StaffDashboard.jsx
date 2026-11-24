@@ -29,7 +29,11 @@ async function staffApi(action, payload = {}) {
     body: JSON.stringify({ action, ...payload }),
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.message || `Request failed (${res.status})`);
+  if (!res.ok) {
+    const error = new Error(data.message || `Request failed (${res.status})`);
+    error.status = res.status;
+    throw error;
+  }
   return data;
 }
 
@@ -97,11 +101,16 @@ export default function StaffDashboard() {
       setLastUpdated(new Date().toLocaleTimeString());
       setError(null);
     } catch (e) {
-      setError(e.message);
-      // If unauthorized, redirect to login
-      if (e.message === 'Unauthorized' || e.message.includes('401')) {
+      // A stale/expired token (for example after SERVER_SESSION_SECRET changes)
+      // must be removed so the login page does not keep reusing it.
+      const unauthorized = e.status === 401 || /unauthorized|valid election view session/i.test(e.message || '');
+      if (unauthorized) {
         localStorage.removeItem('smcoaa_staffToken');
+        localStorage.removeItem('smcoaa_staffSession');
+        setError(null);
         navigate('/staff-login', { replace: true });
+      } else {
+        setError(e.message || 'Could not load Election View data.');
       }
     } finally {
       if (showLoading) setLoading(false);

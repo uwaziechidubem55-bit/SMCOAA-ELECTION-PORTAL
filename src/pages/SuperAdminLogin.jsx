@@ -37,6 +37,10 @@ export default function SuperAdminLogin() {
       if (res.ok && data.success) {
         localStorage.setItem('smcoaa_superToken', data.superToken);
         navigate('/super-admin-dashboard');
+      } else if (res.status === 401) {
+        localStorage.removeItem('smcoaa_adminToken');
+        localStorage.removeItem('smcoaa_superToken');
+        navigate('/admin-login', { replace: true });
       } else {
         setMsg({ type: 'error', text: data.message || 'Wrong code. Try again.' });
         setCode('');
