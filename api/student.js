@@ -57,6 +57,35 @@ async function login(req, res) {
   });
 }
 
+// Public ballot data is intentionally limited to candidate display fields and
+// voter-facing election settings. Firestore access is server-side (Admin SDK),
+// so deny-all Firestore rules remain enabled; member records are never returned.
+async function publicBallotData(req, res) {
+  const ip = clientIp(req);
+  const gate = await consumeRateLimit(getAdminDb(), {
+    scope: 'public-ballot-data', who: ip, rules: [{ limit: 120, windowSec: 60 }],
+  });
+  if (!gate.ok) return res.status(429).json({ success: false, message: 'Too many data requests. Please try again shortly.' });
+
+  const db = getAdminDb();
+  const [candidateSnap, mainSnap, electionSnap] = await Promise.all([
+    db.collection('candidates').get(),
+    db.doc('settings/main').get(),
+    db.doc('settings/election').get(),
+  ]);
+  const candidates = candidateSnap.docs.map((d) => {
+    const data = d.data();
+    return { id: d.id, name: data.name || '', position: data.position || '', photoURL: data.photoURL || '', votes: Number(data.votes) || 0 };
+  });
+  const raw = { ...(electionSnap.exists ? electionSnap.data() : {}), ...(mainSnap.exists ? mainSnap.data() : {}) };
+  const settings = {};
+  for (const key of ['activeMode', 'endDate', 'endTime', 'isActive', 'startDate', 'startTime', 'year']) {
+    if (raw[key] !== undefined) settings[key] = raw[key];
+  }
+  res.setHeader('Cache-Control', 'no-store, max-age=0');
+  return res.status(200).json({ success: true, candidates, settings });
+}
+
 
 // ---- Super Admin live monitoring: who is on which page (no login needed) ----
 // Called by PresenceContext on every page change + every 45s per visitor.
@@ -121,6 +150,7 @@ async function handler(req, res) {
   const { action } = req.query; // set by vercel.json rewrites
   switch (action) {
     case 'login': return login(req, res);
+    case 'publicBallotData': return publicBallotData(req, res);
     case 'presence': return presence(req, res);
     case 'electionStatus': return electionStatus(req, res);
     default:

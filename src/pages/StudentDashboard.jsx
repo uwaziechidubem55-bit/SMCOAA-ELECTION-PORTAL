@@ -1,7 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { db } from '../firebase';
-import { doc, getDoc, collection, getDocs, onSnapshot } from 'firebase/firestore';
 import { SkeletonBox, BallotSkeleton } from '../components/Skeleton';
 import { groupByPosition } from '../utils/positions';
 
@@ -86,49 +84,28 @@ export default function StudentDashboard() {
           setHasVoted(votedStatus);
         }
 
-        // 2. Live Fetch: Query candidates collection directly from Firestore
+        // 2. Fetch public ballot data through the server API. The API uses the
+        // Firebase Admin SDK, so Firestore can keep deny-all client rules.
         try {
-          const candidatesSnap = await getDocs(collection(db, 'candidates'));
-          const candidatesList = [];
-          candidatesSnap.forEach(docSnap => {
-            candidatesList.push({ id: docSnap.id, ...docSnap.data() });
+          const ballotRes = await fetch('/api/student?action=publicBallotData', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
           });
-          setCandidates(candidatesList);
-        } catch (e) {
-          console.error('Error loading candidates:', e);
-          setCandidates([]);
-        }
-
-        // 3. Live Fetch: Merge settings/main and settings/election from Firestore
-        // NOTE: If Firestore returns NO settings (e.g. they were deleted from the DB),
-        // we show a clean/empty state instead of re-using a stale localStorage copy.
-        try {
-          const [mainSnap, electionSnap] = await Promise.all([
-            getDoc(doc(db, 'settings', 'main')),
-            getDoc(doc(db, 'settings', 'election')).catch(() => null)
-          ]);
-          let merged = {};
-          if (electionSnap && electionSnap.exists()) {
-            merged = { ...electionSnap.data() };
-          }
-          if (mainSnap && mainSnap.exists()) {
-            merged = { ...merged, ...mainSnap.data() };
-          }
-
+          const ballotData = await ballotRes.json();
+          if (!ballotRes.ok || !ballotData.success) throw new Error(ballotData.message || 'Could not load ballot data');
+          setCandidates(Array.isArray(ballotData.candidates) ? ballotData.candidates : []);
+          const merged = ballotData.settings || {};
           if (Object.keys(merged).length > 0) {
             setSettings(merged);
             localStorage.setItem('smcoaa_electionSettings', JSON.stringify(merged));
           } else {
-            // DB has no election settings — clear the stale cache and show a clean state.
             localStorage.removeItem('smcoaa_electionSettings');
             setSettings({});
           }
         } catch (e) {
-          // Only fall back to the cache on a REAL error (network / Firestore failure),
-          // never on an empty DB response.
-          console.error('Error loading settings:', e);
+          console.error('Error loading ballot data through API:', e);
           const savedSettings = JSON.parse(localStorage.getItem('smcoaa_electionSettings') || '{}');
           setSettings(savedSettings);
+          setCandidates([]);
         }
 
       } catch (e) {
@@ -141,14 +118,28 @@ export default function StudentDashboard() {
     loadData();
   }, []);
 
-  // Live candidate tally updates for every voter while the election is running.
+  // Refresh candidate tallies through the server API; no browser Firestore access.
   useEffect(() => {
     if (!localStorage.getItem('smcoaa_voterSession')) return undefined;
-    return onSnapshot(collection(db, 'candidates'), (snapshot) => {
-      setCandidates(snapshot.docs.map((candidateDoc) => ({ id: candidateDoc.id, ...candidateDoc.data() })));
-    }, (snapshotError) => {
-      console.error('Live candidate update failed:', snapshotError);
-    });
+    let active = true;
+    const refresh = async () => {
+      try {
+        const res = await fetch('/api/student?action=publicBallotData', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+        });
+        const data = await res.json();
+        if (active && res.ok && data.success) {
+          setCandidates(Array.isArray(data.candidates) ? data.candidates : []);
+          const merged = data.settings || {};
+          setSettings(merged);
+          if (Object.keys(merged).length) localStorage.setItem('smcoaa_electionSettings', JSON.stringify(merged));
+        }
+      } catch (err) {
+        console.error('API ballot refresh failed:', err);
+      }
+    };
+    const timer = setInterval(refresh, 15000);
+    return () => { active = false; clearInterval(timer); };
   }, []);
 
   // ── Election clock: the PORTAL decides, never this phone's clock ──

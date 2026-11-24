@@ -18,14 +18,7 @@ The code reads these values from the Vercel server environment. The Election Vie
 
 ## Firebase / Firestore (set up later)
 
-Browser Firebase variables:
-
-- `VITE_FIREBASE_API_KEY`
-- `VITE_FIREBASE_AUTH_DOMAIN`
-- `VITE_FIREBASE_PROJECT_ID`
-- `VITE_FIREBASE_STORAGE_BUCKET`
-- `VITE_FIREBASE_MESSAGING_SENDER_ID`
-- `VITE_FIREBASE_APP_ID`
+The browser does not connect directly to Firebase. All Firestore operations use Vercel API routes and the Firebase Admin SDK, so Firestore can use deny-all client rules. Public ballot responses are limited to candidate display fields and voter-facing election settings; member documents stay server-side.
 
 Server-side Admin SDK:
 
