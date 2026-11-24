@@ -4,6 +4,8 @@ import { withApiSafety } from './_http.js';
 import { createHash } from 'crypto';
 import { writeAudit } from './_audit.js';
 import { electionEndStampFor, getElectionStatus } from './_election.js';
+import { MEMBERS } from '../src/config/members.js';
+import { addNewMembers, parseMemberCsv, previewMembers } from './_memberImport.js';
 
 let getAdminDb, verifyToken, signToken;
 
@@ -175,6 +177,36 @@ async function handler(req, res) {
         const snap = await db.collection('members').get();
         // Admin Dashboard currently needs turnout counts only; avoid exporting the private roll.
         return res.json({ success: true, items: snap.docs.map(d => ({ hasVoted: Boolean(d.data().hasVoted) })) });
+      }
+      case 'previewMemberImport': {
+        try {
+          const rows = parseMemberCsv(payload.csvText);
+          const preview = await previewMembers(db, rows);
+          return res.json({ success: true, preview });
+        } catch (error) {
+          return res.status(400).json({ success: false, message: error.message || 'Member file is invalid.' });
+        }
+      }
+      case 'importMemberCsv': {
+        try {
+          const rows = parseMemberCsv(payload.csvText);
+          const result = await addNewMembers(db, rows);
+          try { await writeAudit({ db, actor: 'admin', action: 'MEMBER_ROSTER_IMPORTED', details: { source: 'csv', ...result } }); }
+          catch (auditError) { console.warn('Member import audit write failed:', auditError.message); }
+          return res.json({ success: true, ...result, note: 'Existing member documents and vote states were not changed.' });
+        } catch (error) {
+          return res.status(400).json({ success: false, message: error.message || 'Member import failed validation.' });
+        }
+      }
+      case 'seedFixedRoster': {
+        try {
+          const result = await addNewMembers(db, MEMBERS);
+          try { await writeAudit({ db, actor: 'admin', action: 'FIXED_ROSTER_SEEDED', details: result }); }
+          catch (auditError) { console.warn('Fixed roster audit write failed:', auditError.message); }
+          return res.json({ success: true, ...result, note: 'Only missing fixed-roster records were added; existing records and vote states were not changed.' });
+        } catch (error) {
+          return res.status(400).json({ success: false, message: error.message || 'Fixed roster could not be loaded.' });
+        }
       }
       case 'findMemberSnByName': {
         const query = typeof payload.name === 'string' ? payload.name.trim().replace(/\s+/g, ' ').toLocaleLowerCase() : '';

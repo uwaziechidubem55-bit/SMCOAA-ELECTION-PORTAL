@@ -1,26 +1,10 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Candidate cards and election schedule are public display data only.
-    // Every mutation is performed through the server-side Admin SDK APIs.
-    match /candidates/{candidateId} {
-      allow read: if true;
-      allow write: if false;
+    // All Firestore access goes through authenticated server APIs using the
+    // Firebase Admin SDK. The Admin SDK bypasses Firestore security rules.
+    match /{document=**} {
+      allow read, write: if false;
     }
-    match /settings/main {
-      allow read: if true;
-      allow write: if false;
-    }
-    match /settings/election {
-      allow read: if true;
-      allow write: if false;
-    }
-    // Never expose member credentials, presence, audit, support, or admin data
-    // to the browser SDK. Server APIs use Firebase Admin and enforce auth.
-    match /members/{memberId} { allow read, write: if false; }
-    match /presence/{presenceId} { allow read, write: if false; }
-    match /auditLogs/{logId} { allow read, write: if false; }
-    match /supportMessages/{messageId} { allow read, write: if false; }
-    match /{document=**} { allow read, write: if false; }
   }
 }

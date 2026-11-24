@@ -168,6 +168,28 @@ export class FakeFirestore {
   doc(path) { return new DocRef(this, path); }
   collection(path) { return new CollectionRef(this, path); }
 
+  batch() {
+    const operations = [];
+    return {
+      set: (ref, data, options = {}) => { operations.push({ kind: 'set', ref, data, options }); return this; },
+      create: (ref, data) => { operations.push({ kind: 'create', ref, data }); return this; },
+      commit: async () => {
+        const backup = new Map(this.store);
+        try {
+          for (const op of operations) {
+            if (op.kind === 'create' && this.store.has(op.ref.path)) {
+              throw Object.assign(new Error(`6 ALREADY_EXISTS: ${op.ref.path}`), { code: 6 });
+            }
+            this._write(op.ref.path, applyWrite(this.store.get(op.ref.path), op.data, op.kind === 'set' && !!op.options.merge));
+          }
+          return operations.map(() => ({}));
+        } catch (error) {
+          this.store = backup;
+          throw error;
+        }
+      },
+    };
+  }
   runTransaction(fn) {
     const run = async () => {
       if (this.failNextTransactions > 0) {

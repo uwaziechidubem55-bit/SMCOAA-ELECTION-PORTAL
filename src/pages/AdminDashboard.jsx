@@ -193,7 +193,10 @@ export default function AdminDashboard() {
   const [memberLookupResults, setMemberLookupResults] = useState([]);
   const [memberLookupMsg, setMemberLookupMsg] = useState('');
   const [memberLookupBusy, setMemberLookupBusy] = useState(false);
-
+  const [rosterBusy, setRosterBusy] = useState(false);
+  const [rosterMessage, setRosterMessage] = useState({ type: '', text: '' });
+  const [rosterCsv, setRosterCsv] = useState('');
+  const [rosterPreview, setRosterPreview] = useState(null);
 
   const [voters, setVoters] = useState([]);
   const [supportMessages, setSupportMessages] = useState([]);
@@ -460,6 +463,63 @@ export default function AdminDashboard() {
     }
   };
 
+  const seedFixedRoster = async () => {
+    const confirmed = window.confirm('Add any missing members from the current fixed voter roll? Existing member records and vote states will not be changed.');
+    if (!confirmed || rosterBusy) return;
+    setRosterBusy(true);
+    setRosterMessage({ type: '', text: '' });
+    try {
+      const result = await adminApi('seedFixedRoster');
+      setRosterMessage({ type: 'success', text: `Complete: ${result.created} added; ${result.alreadyPresent} already existed. Existing vote records were preserved.` });
+      await loadAllData(false);
+    } catch (error) {
+      setRosterMessage({ type: 'error', text: error.message || 'Could not load the fixed voter roll.' });
+    } finally {
+      setRosterBusy(false);
+    }
+  };
+
+  const previewRosterCsv = async (file) => {
+    setRosterCsv('');
+    setRosterPreview(null);
+    setRosterMessage({ type: '', text: '' });
+    if (!file) return;
+    if (file.size > 1024 * 1024) {
+      setRosterMessage({ type: 'error', text: 'CSV must be 1 MB or smaller.' });
+      return;
+    }
+    try {
+      const csvText = await file.text();
+      const result = await adminApi('previewMemberImport', { csvText });
+      setRosterCsv(csvText);
+      setRosterPreview(result.preview);
+      setRosterMessage({ type: 'success', text: `Validated ${result.preview.total} rows. ${result.preview.toCreate} new members will be added; ${result.preview.alreadyPresent} existing IDs will be skipped.` });
+    } catch (error) {
+      setRosterMessage({ type: 'error', text: error.message || 'CSV validation failed. No records were written.' });
+    }
+  };
+
+  const importRosterCsv = async () => {
+    if (!rosterCsv || !rosterPreview || rosterBusy) return;
+    const confirmed = window.confirm(`Add ${rosterPreview.toCreate} new member(s)? Existing records, including hasVoted, will not be changed. No records are deleted.`);
+    if (!confirmed) return;
+    setRosterBusy(true);
+    setRosterMessage({ type: '', text: '' });
+    try {
+      const result = await adminApi('importMemberCsv', { csvText: rosterCsv });
+      setRosterMessage({ type: 'success', text: `Import complete: ${result.created} added; ${result.alreadyPresent} existing IDs skipped. Existing member documents and vote states were preserved.` });
+      setRosterCsv('');
+      setRosterPreview(null);
+      const input = document.getElementById('member-roster-csv');
+      if (input) input.value = '';
+      await loadAllData(false);
+    } catch (error) {
+      setRosterMessage({ type: 'error', text: error.message || 'Import failed. No existing vote state was changed.' });
+    } finally {
+      setRosterBusy(false);
+    }
+  };
+
   useEffect(() => {
     loadAllData(true);
 
@@ -489,6 +549,7 @@ export default function AdminDashboard() {
     { key: 'dashboard', label: 'Dashboard', icon: '📊' },
     { key: 'settings', label: 'Election Settings', icon: '⚙️' },
     { key: 'member-lookup', label: 'Find Member S/N', icon: '🔎' },
+    { key: 'voter-roll', label: 'Voter Roll Import', icon: '📥' },
     { key: 'candidates', label: 'Manage Candidates', icon: '👥' },
     { key: 'activation', label: 'Activation', icon: '🔘' },
     { key: 'results', label: 'Election Results', icon: '📈' },
@@ -953,6 +1014,31 @@ export default function AdminDashboard() {
             </form>
             {memberLookupMsg && <p role="status" style={{ color: '#6b6472', marginTop: 14 }}>{memberLookupMsg}</p>}
             {memberLookupResults.length > 0 && <div style={{ marginTop: 16, overflowX: 'auto' }}><table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left' }}><thead><tr>{['Name', 'Set', 'S/N', 'Sex'].map(label => <th key={label} style={{ padding: 10, background: '#f4f0fa', color: '#341D61' }}>{label}</th>)}</tr></thead><tbody>{memberLookupResults.map((member, index) => <tr key={`${member.set}-${member.sn}-${index}`}><td style={{ padding: 10, borderBottom: '1px solid #eee' }}>{member.name}</td><td style={{ padding: 10, borderBottom: '1px solid #eee' }}>{member.set}</td><td style={{ padding: 10, borderBottom: '1px solid #eee', fontWeight: 700 }}>{member.sn}</td><td style={{ padding: 10, borderBottom: '1px solid #eee' }}>{member.sex || '—'}</td></tr>)}</tbody></table></div>}
+          </div>
+        )}
+
+        {activeView === 'voter-roll' && (
+          <div style={cardStyle}>
+            <h2 style={{ color: '#341D61', marginBottom: 8 }}>📥 Voter Roll Import</h2>
+            <p style={{ color: '#555', lineHeight: 1.55 }}>
+              Add the existing fixed roll or later members through this Admin-only server API. Imports are add-only: existing member documents are skipped, never overwritten or deleted, and their <code>hasVoted</code> state is never changed. Every imported record starts with <code>hasVoted: false</code>.
+            </p>
+            <div style={{ background: '#f4f0fa', border: '1px solid #e5e1ec', borderRadius: 10, padding: 14, marginBottom: 16 }}>
+              <strong style={{ color: '#341D61' }}>Step 1 · Load current fixed voter roll</strong>
+              <p style={{ margin: '6px 0 12px', color: '#5b5663', fontSize: 14 }}>This adds only missing records from the project’s fixed roll. It is safe to retry; existing records and votes are preserved.</p>
+              <button onClick={seedFixedRoster} disabled={rosterBusy} style={{ ...btnPrimary, opacity: rosterBusy ? 0.65 : 1 }}>{rosterBusy ? 'Working…' : 'Load missing fixed-roll members'}</button>
+            </div>
+            <div style={{ border: '1px solid #e5e1ec', borderRadius: 10, padding: 14 }}>
+              <strong style={{ color: '#341D61' }}>Step 2 · Add future members from CSV</strong>
+              <p style={{ margin: '6px 0 12px', color: '#5b5663', fontSize: 14 }}>CSV headers must be <code>Set,S/N,Name,Sex</code>. Allowed Sex values: Male, Female, Not specified, Prefer not to say. Maximum 1,000 rows and 1 MB per import.</p>
+              <a href={`data:text/csv;charset=utf-8,${encodeURIComponent('Set,S/N,Name,Sex\n2026,1,Example Member,Male\n')}`} download="SMCOAA-member-import-template.csv" style={{ color: '#341D61', fontWeight: 700 }}>Download CSV template</a>
+              <label htmlFor="member-roster-csv" style={{ display: 'block', marginTop: 14, marginBottom: 8, fontWeight: 700, color: '#332b3e' }}>Choose a member CSV file</label>
+              <input id="member-roster-csv" type="file" accept=".csv,text/csv" disabled={rosterBusy} onChange={e => previewRosterCsv(e.target.files?.[0])} />
+              {rosterPreview && <p style={{ color: '#332b3e', margin: '12px 0' }}>Preview: {rosterPreview.total} valid row(s); {rosterPreview.toCreate} new; {rosterPreview.alreadyPresent} existing Set/S/N IDs will be skipped.</p>}
+              <button onClick={importRosterCsv} disabled={rosterBusy || !rosterPreview || rosterPreview.toCreate < 1} style={{ ...btnPrimary, marginTop: 12, opacity: rosterBusy || !rosterPreview || rosterPreview.toCreate < 1 ? 0.55 : 1 }}>{rosterBusy ? 'Working…' : 'Confirm and add new members'}</button>
+            </div>
+            {rosterMessage.text && <div role="status" style={{ marginTop: 14, padding: 12, borderRadius: 8, background: rosterMessage.type === 'error' ? '#fee2e2' : '#ecfdf3', color: rosterMessage.type === 'error' ? '#b91c1c' : '#166534', fontWeight: 700 }}>{rosterMessage.text}</div>}
+            <p style={{ color: '#6b6472', fontSize: 13, marginTop: 16 }}>Firestore remains deny-all for browser clients. The server validates every row and writes through Firebase Admin; members are not loaded into the browser bundle.</p>
           </div>
         )}
 
