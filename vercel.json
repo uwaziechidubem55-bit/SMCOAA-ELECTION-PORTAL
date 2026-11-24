@@ -1,0 +1,60 @@
+{
+  "framework": "vite",
+  "rewrites": [
+    {
+      "source": "/api/student-login",
+      "destination": "/api/student?action=login"
+    },
+    {
+      "source": "/api/admin-login",
+      "destination": "/api/admin-auth?action=login"
+    },
+    {
+      "source": "/api/verify-session",
+      "destination": "/api/admin-auth?action=verify"
+    },
+    {
+      "source": "/api/upload",
+      "destination": "/api/upload?purpose=candidate"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
+    }
+  ],
+  "redirects": [
+    {
+      "source": "/staff-monitor",
+      "destination": "/staff-login",
+      "statusCode": 302
+    }
+  ],
+  "crons": [],
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "no-cache, no-store, must-revalidate"
+        },
+        {
+          "key": "X-Content-Type-Options",
+          "value": "nosniff"
+        },
+        {
+          "key": "Referrer-Policy",
+          "value": "strict-origin-when-cross-origin"
+        },
+        {
+          "key": "X-Frame-Options",
+          "value": "DENY"
+        },
+        {
+          "key": "Permissions-Policy",
+          "value": "camera=(), microphone=(), geolocation=()"
+        }
+      ]
+    }
+  ]
+}

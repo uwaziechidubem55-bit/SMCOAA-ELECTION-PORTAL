@@ -1,0 +1,862 @@
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { db } from '../firebase';
+import { doc, getDoc, collection, getDocs, onSnapshot } from 'firebase/firestore';
+import { SkeletonBox, BallotSkeleton } from '../components/Skeleton';
+import { groupByPosition } from '../utils/positions';
+
+export default function StudentDashboard() {
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [candidates, setCandidates] = useState([]);
+  const [settings, setSettings] = useState({});
+  const [hasVoted, setHasVoted] = useState(false);
+  const [voting, setVoting] = useState(false);
+  const [student, setStudent] = useState(null);
+  const [currentTime, setCurrentTime] = useState(''); // ← ADDED
+  const [selectedCandidates, setSelectedCandidates] = useState({}); // ← Stores { [position]: candidateId }
+  const navigate = useNavigate();
+
+  // ← ADDED: Real-time clock
+  useEffect(() => {
+    const updateTime = () => {
+      const now = new Date();
+      const hours = String(now.getHours()).padStart(2, '0');
+      const minutes = String(now.getMinutes()).padStart(2, '0');
+      setCurrentTime(`${hours}:${minutes}`);
+    };
+    updateTime();
+    const timer = setInterval(updateTime, 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // 🌅 Greeting helper — based on current local time
+  const getGreeting = () => {
+    const hour = new Date().getHours();
+    if (hour < 12) return 'Good Morning';
+    if (hour < 17) return 'Good Afternoon';
+    return 'Good Evening';
+  };
+
+  useEffect(() => {
+    const loadData = async () => {
+      try {
+        const savedStudent = JSON.parse(localStorage.getItem('smcoaa_voterSession'));
+
+        if (!savedStudent || !savedStudent.set || !savedStudent.sn) {
+          setError('No voter data. Please sign in.');
+          setLoading(false);
+          return;
+        }
+        setStudent(savedStudent);
+
+        // 1. Live Fetch: Query Firestore directly for the live status of the student
+        try {
+          const liveRes = await fetch('/api/student-login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: `set of ${savedStudent.set}`, password: String(savedStudent.sn) })
+          });
+          if (liveRes.ok) {
+            const liveData = await liveRes.json();
+            if (liveData.member) {
+              const liveHasVoted = Boolean(liveData.member.hasVoted);
+              setHasVoted(liveHasVoted);
+              // Clean up stale local cache if Firestore is reset
+              if (!liveHasVoted) {
+                localStorage.removeItem(`smcoaa_voted_${savedStudent.set}-${savedStudent.sn}`);
+              } else {
+                localStorage.setItem(`smcoaa_voted_${savedStudent.set}-${savedStudent.sn}`, 'true');
+              }
+              setStudent({ ...savedStudent, ...liveData.member });
+            }
+          } else if (liveRes.status === 404) {
+            // Student was deleted from Firestore
+            localStorage.removeItem('smcoaa_voterSession');
+            localStorage.removeItem(`smcoaa_voted_${savedStudent.set}-${savedStudent.sn}`);
+            
+            setError('Voter record was not found. Please check your set and S/N.');
+            setLoading(false);
+            return;
+          }
+        } catch (liveErr) {
+          // Fallback only if device is completely offline
+          const votedKey = `smcoaa_voted_${savedStudent.set}-${savedStudent.sn}`;
+          const votedStatus = savedStudent.hasVoted === true || localStorage.getItem(votedKey) === 'true';
+          setHasVoted(votedStatus);
+        }
+
+        // 2. Live Fetch: Query candidates collection directly from Firestore
+        try {
+          const candidatesSnap = await getDocs(collection(db, 'candidates'));
+          const candidatesList = [];
+          candidatesSnap.forEach(docSnap => {
+            candidatesList.push({ id: docSnap.id, ...docSnap.data() });
+          });
+          setCandidates(candidatesList);
+        } catch (e) {
+          console.error('Error loading candidates:', e);
+          setCandidates([]);
+        }
+
+        // 3. Live Fetch: Merge settings/main and settings/election from Firestore
+        // NOTE: If Firestore returns NO settings (e.g. they were deleted from the DB),
+        // we show a clean/empty state instead of re-using a stale localStorage copy.
+        try {
+          const [mainSnap, electionSnap] = await Promise.all([
+            getDoc(doc(db, 'settings', 'main')),
+            getDoc(doc(db, 'settings', 'election')).catch(() => null)
+          ]);
+          let merged = {};
+          if (electionSnap && electionSnap.exists()) {
+            merged = { ...electionSnap.data() };
+          }
+          if (mainSnap && mainSnap.exists()) {
+            merged = { ...merged, ...mainSnap.data() };
+          }
+
+          if (Object.keys(merged).length > 0) {
+            setSettings(merged);
+            localStorage.setItem('smcoaa_electionSettings', JSON.stringify(merged));
+          } else {
+            // DB has no election settings — clear the stale cache and show a clean state.
+            localStorage.removeItem('smcoaa_electionSettings');
+            setSettings({});
+          }
+        } catch (e) {
+          // Only fall back to the cache on a REAL error (network / Firestore failure),
+          // never on an empty DB response.
+          console.error('Error loading settings:', e);
+          const savedSettings = JSON.parse(localStorage.getItem('smcoaa_electionSettings') || '{}');
+          setSettings(savedSettings);
+        }
+
+      } catch (e) {
+        console.error('Fatal error:', e);
+        setError('Error: ' + e.message);
+      }
+      setLoading(false);
+    };
+
+    loadData();
+  }, []);
+
+  // Live candidate tally updates for every voter while the election is running.
+  useEffect(() => {
+    if (!localStorage.getItem('smcoaa_voterSession')) return undefined;
+    return onSnapshot(collection(db, 'candidates'), (snapshot) => {
+      setCandidates(snapshot.docs.map((candidateDoc) => ({ id: candidateDoc.id, ...candidateDoc.data() })));
+    }, (snapshotError) => {
+      console.error('Live candidate update failed:', snapshotError);
+    });
+  }, []);
+
+  // ── Election clock: the PORTAL decides, never this phone's clock ──
+  // The server tells us its own time and whether the election is coming, live
+  // or ended. We keep counting from that answer with a timer that does not
+  // follow the phone's date/time setting, so changing the phone clock changes
+  // nothing. (The server also refuses votes outside the election.)
+  const [portal, setPortal] = useState(null);            // last answer from the portal
+  const [portalNow, setPortalNow] = useState(0);         // the portal's time, kept ticking here
+  const [portalChecked, setPortalChecked] = useState(false);
+  const portalSyncRef = useRef({ serverNow: 0, perfAt: 0, lastTry: -Infinity });
+
+  const syncPortalClock = useCallback(async () => {
+    portalSyncRef.current.lastTry = performance.now();
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const giveUp = controller ? setTimeout(() => controller.abort(), 8000) : null;
+    try {
+      const res = await fetch('/api/student?action=electionStatus', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+        signal: controller ? controller.signal : undefined,
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data || !data.success || typeof data.serverNow !== 'number') return false;
+      // Count from the moment the answer ARRIVED: we are never ahead of the portal.
+      portalSyncRef.current.serverNow = data.serverNow;
+      portalSyncRef.current.perfAt = performance.now();
+      setPortal(data);
+      setPortalNow(data.serverNow);
+      return true;
+    } catch (e) {
+      return false; // offline: the page keeps its last answer
+    } finally {
+      if (giveUp) clearTimeout(giveUp);
+    }
+  }, []);
+
+  // First check when the page opens, then every minute, and whenever the
+  // student comes back to the page or the network returns.
+  useEffect(() => {
+    let alive = true;
+    syncPortalClock().finally(() => { if (alive) setPortalChecked(true); });
+    const whenVisible = () => { if (document.visibilityState === 'visible') syncPortalClock(); };
+    const every = setInterval(whenVisible, 60000);
+    document.addEventListener('visibilitychange', whenVisible);
+    window.addEventListener('online', whenVisible);
+    return () => {
+      alive = false;
+      clearInterval(every);
+      document.removeEventListener('visibilitychange', whenVisible);
+      window.removeEventListener('online', whenVisible);
+    };
+  }, [syncPortalClock]);
+
+  // Keep the portal's time moving between checks (every second while counting down).
+  useEffect(() => {
+    if (!portal) return undefined;
+    const portalTime = () => portalSyncRef.current.serverNow + (performance.now() - portalSyncRef.current.perfAt);
+    const tick = () => setPortalNow(portalTime());
+    tick();
+    const id = setInterval(tick, portal.phase === 'upcoming' ? 1000 : 5000);
+    // Also wake up exactly at the next change (start, end, end of the 24-hour notice),
+    // so the screen changes at that moment and not a few seconds later.
+    const next = [portal.startAt, portal.endAt, portal.endedUntil]
+      .filter((t) => typeof t === 'number' && t > portalTime())
+      .sort((a, b) => a - b)[0];
+    const wait = next ? next - portalTime() : null;
+    const once = wait !== null && wait < 2000000000 ? setTimeout(tick, wait + 30) : null;
+    return () => { clearInterval(id); if (once) clearTimeout(once); };
+  }, [portal]);
+
+  // What to show right now, from the portal's last answer and the portal's time.
+  // The steps follow one another, so a phone that lost its network before the
+  // start still moves on to "live" and then to "ended" at the right moments.
+  let portalPhase = portal ? portal.phase : null;
+  if (portal) {
+    if (portalPhase === 'upcoming' && portal.startAt && portalNow >= portal.startAt) portalPhase = portal.active ? 'live' : 'idle';
+    if (portalPhase === 'live' && portal.endAt && portalNow >= portal.endAt) portalPhase = 'ended';
+    if (portalPhase === 'ended') {
+      const until = portal.endedUntil || (portal.endAt ? portal.endAt + 24 * 60 * 60 * 1000 : null);
+      if (until && portalNow >= until) portalPhase = 'idle';
+    }
+  }
+
+  // The moment a start / end time is reached here, confirm it with the portal.
+  useEffect(() => {
+    if (!portal || portalPhase === portal.phase) return undefined;
+    const sinceLastTry = performance.now() - portalSyncRef.current.lastTry;
+    const id = setTimeout(syncPortalClock, Math.max(700, 2500 - sinceLastTry));
+    return () => clearTimeout(id);
+  }, [portal, portalPhase, syncPortalClock]);
+
+  const handleLogout = () => {
+    localStorage.removeItem('smcoaa_voterSession');
+     // ← clears the voting key
+    navigate('/student-login');
+  };
+
+  // ✅ Connects directly to AdminDashboard activation state (activeMode: 'election' | 'both')
+  const isModeActive = settings.activeMode === 'election' || settings.activeMode === 'both' || settings.isActive === true || settings.isActive === 'true';
+
+  let startDateTime = null;
+  if (settings.startDate) {
+    const timeStr = settings.startTime ? settings.startTime : '00:00';
+    startDateTime = new Date(`${settings.startDate}T${timeStr}`);
+  }
+
+  let endDateTime = null;
+  if (settings.endDate) {
+    const timeStr = settings.endTime ? settings.endTime : '23:59';
+    endDateTime = new Date(`${settings.endDate}T${timeStr}`);
+  }
+
+  const now = new Date();
+  const isElectionStarted = startDateTime ? (now >= startDateTime) : true;
+  const isElectionEnded = endDateTime ? (now >= endDateTime) : false;
+  // The portal's answer wins. The phone-clock rule above is only a fallback for
+  // when the portal clock could not be reached at all (the server still refuses
+  // any vote outside the election).
+  const isVotingOpen = portal ? portalPhase === 'live' : (isModeActive && isElectionStarted && !isElectionEnded);
+  const showElectionEnded = portal ? portalPhase === 'ended' : false;
+  const countdownMs = portal && portalPhase === 'upcoming' && portal.startAt ? Math.max(0, portal.startAt - portalNow) : null;
+  const scheduleDate = portal ? portal.startDate : settings.startDate;
+  const scheduleTime = portal ? portal.startTime : settings.startTime;
+  // The "Scheduled" line is only for a start that is still ahead (never an old, past date).
+  const showSchedule = portal ? portalPhase === 'upcoming' : !showElectionEnded;
+
+  // ✅ 1. Locked Selection: Once voted in this position, choice is locked and cannot be changed
+  const handleSelectCandidate = (positionName, candidateId) => {
+    if (!isVotingOpen) { alert('Voting is not open.'); return; }
+    if (selectedCandidates[positionName]) {
+      return; // Locked: selection cannot be changed
+    }
+    setSelectedCandidates(prev => ({
+      ...prev,
+      [positionName]: candidateId
+    }));
+  };
+
+  // ✅ 2. Final Submission of all selected position votes (ONLY counts on submit)
+  const handleSubmitFinalBallot = async () => {
+    if (!isVotingOpen) { alert('Voting is not open.'); return; }
+
+    const voteIds = Object.values(selectedCandidates);
+    if (voteIds.length === 0) {
+      alert('Please select at least one candidate before submitting.');
+      return;
+    }
+
+    setVoting(true);
+    try {
+      const res = await fetch('/api/vote', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          set: student.set,
+          sn: student.sn,
+          candidateIds: voteIds
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+
+      // 409 = already voted (server-side truth) — sync local state and stop
+      if (res.status === 409) {
+        localStorage.setItem(`smcoaa_voted_${student.set}-${student.sn}`, 'true');
+        const saved = JSON.parse(localStorage.getItem('smcoaa_voterSession') || '{}');
+        saved.hasVoted = true;
+        localStorage.setItem('smcoaa_voterSession', JSON.stringify(saved));
+        setHasVoted(true);
+        alert('You have already voted.');
+        return;
+      }
+
+      // The portal says the election is not live (not started / ended): show its
+      // message and bring this screen in line with the portal.
+      if (res.status === 403 && data.code === 'ELECTION_NOT_LIVE') {
+        alert(data.message || 'Voting is not open right now.');
+        syncPortalClock();
+        return;
+      }
+
+      // The portal refused the ballot itself — two choices for one position, or a
+      // candidate who is no longer on the ballot. Nothing was recorded. Choices are
+      // locked on this screen, so show why and reload: the voter picks again from
+      // the ballot as it is now.
+      if (res.status === 400 && (data.code === 'ONE_VOTE_PER_POSITION' || data.code === 'CANDIDATE_NOT_FOUND')) {
+        alert(data.message || 'Your ballot was not accepted. Please choose again.');
+        window.location.reload();
+        return;
+      }
+
+      if (!res.ok) throw new Error(data.message || `Request failed (${res.status})`);
+
+      // Permanent update after server confirms
+      const updated = candidates.map(c =>
+        voteIds.includes(c.id) ? { ...c, votes: (c.votes || 0) + 1 } : c
+      );
+      setCandidates(updated);
+
+      localStorage.setItem(`smcoaa_voted_${student.set}-${student.sn}`, 'true');
+      const saved = JSON.parse(localStorage.getItem('smcoaa_voterSession') || '{}');
+      saved.hasVoted = true;
+      localStorage.setItem('smcoaa_voterSession', JSON.stringify(saved));
+      setHasVoted(true);
+    } catch (e) {
+      alert('Error submitting vote: ' + e.message);
+    } finally {
+      setVoting(false);
+    }
+  };
+
+  const getStatusBadge = () => {
+    if (portal && isVotingOpen) return { text: 'LIVE', color: '#16a34a' };
+    if (!isModeActive) return { text: 'NOT CONFIGURED', color: '#6b7280' };
+    if (!isElectionStarted) return { text: 'COMING SOON', color: '#f59e0b' };
+    if (isElectionEnded) return { text: 'ENDED', color: '#dc2626' };
+    return { text: 'LIVE', color: '#16a34a' };
+  };
+
+  const badge = getStatusBadge();
+  // One section per position. The same position typed differently for two
+  // candidates ("Asst. X " / "ASST. X") is ONE section, so a voter can pick only
+  // one of them (src/utils/positions.js). The portal enforces the same rule.
+  const ballotSections = groupByPosition(candidates);
+
+  // ✅ 3. Hierarchy of Power Ranking (President first, VP second, Sec Gen third, etc.)
+  const getPositionRank = (pos) => {
+    const p = String(pos || '').trim().toLowerCase();
+    if (p === 'president') return 1;
+    if (p.includes('vice president') || p.includes('vice-president') || p.includes('vp')) return 2;
+    if (p.includes('general secretary') || p.includes('secretary general') || p.includes('sec gen')) return 3;
+    if (p.includes('assistant general secretary') || p.includes('assistant sec')) return 4;
+    if (p.includes('financial secretary') || p.includes('fin sec')) return 5;
+    if (p.includes('treasurer')) return 6;
+    if (p.includes('social')) return 7;
+    if (p.includes('sport')) return 8;
+    if (p.includes('public relations') || p.includes('p.r.o') || p.includes('pro')) return 9;
+    if (p.includes('welfare')) return 10;
+    if (p.includes('academic') || p.includes('provost')) return 11;
+    return 100; // All other positions after
+  };
+
+  const positions = ballotSections.sort((a, b) => {
+    const rankA = getPositionRank(a.label);
+    const rankB = getPositionRank(b.label);
+    if (rankA !== rankB) return rankA - rankB;
+    return a.label.localeCompare(b.label);
+  });
+
+  // ✅ Per-position percentage map: candidateId -> formatted percent string
+  // - Before the first vote in a position, every candidate shows a neutral 100%.
+  // - After votes come in, the 100% is divided proportionally across the position.
+  //   Whole-number rounding is nudged so each position always sums to exactly 100%.
+  const buildPositionPercentages = (posCandidates) => {
+    const map = {};
+    const totalVotes = posCandidates.reduce((s, c) => s + (c.votes || 0), 0);
+
+    if (totalVotes <= 0) {
+      // Unopposed candidates automatically show 100%; contested positions stay at 0% until voting starts.
+      const unopposed = posCandidates.length === 1;
+      posCandidates.forEach(c => { map[c.id] = unopposed ? '100%' : '0%'; });
+      return map;
+    }
+
+    // Real proportional percentages.
+    const raw = posCandidates.map(c => {
+      const pct = ((c.votes || 0) / totalVotes) * 100;
+      return { id: c.id, pct, floor: Math.floor(pct) };
+    });
+
+    const flooredSum = raw.reduce((s, r) => s + r.floor, 0);
+    let remainder = 100 - flooredSum;
+
+    // Nudge the candidates with the largest leftover fraction first, until we hit 100%.
+    const sorted = [...raw].sort((a, b) =>
+      (b.pct - b.floor) - (a.pct - a.floor)
+    );
+    const adjusted = new Map(raw.map(r => [r.id, r.floor]));
+    for (const r of sorted) {
+      if (remainder <= 0) break;
+      adjusted.set(r.id, adjusted.get(r.id) + 1);
+      remainder--;
+    }
+
+    raw.forEach(r => {
+      map[r.id] = `${adjusted.get(r.id)}%`;
+    });
+    return map;
+  };
+
+  // ── Styles ──
+  const sectionStyle = {
+    marginBottom: '48px',
+    background: '#fff',
+    borderRadius: '16px',
+    padding: '32px 24px',
+    border: '1px solid #e5e1ec',
+    boxShadow: '0 8px 28px rgba(52,29,97,0.08)',
+  };
+
+  const positionHeadingStyle = {
+    fontSize: '36px',
+    fontWeight: '900',
+    textTransform: 'uppercase',
+    textAlign: 'center',
+    letterSpacing: '4px',
+    color: '#341D61',
+    marginBottom: '32px',
+    paddingBottom: '16px',
+    borderBottom: '3px solid #341D61',
+    textShadow: 'none',
+    fontFamily: "'Segoe UI', Tahoma, sans-serif",
+  };
+
+  const cardStyle = {
+    background: '#fff',
+    border: '1px solid #e5e1ec',
+    borderRadius: '14px',
+    padding: '28px 20px 24px',
+    textAlign: 'center',
+    transition: 'all 0.2s ease',
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    position: 'relative', // ← Position relative for top-right vote count badge
+  };
+
+  const photoStyle = {
+    width: '132px',
+    height: '132px',
+    borderRadius: '50%',
+    objectFit: 'cover',
+    border: '4px solid #341D61',
+    boxShadow: '0 0 20px rgba(52,29,97,0.18)',
+    marginBottom: '18px',
+  };
+
+  const nameStyle = {
+    fontSize: '22px',
+    fontWeight: '700',
+    color: '#21143D',
+    marginBottom: '6px',
+    fontFamily: "'Segoe UI', Tahoma, sans-serif",
+    whiteSpace: 'nowrap',
+  };
+
+  const positionLabelStyle = {
+    fontSize: '14px',
+    fontWeight: '600',
+    color: '#6b6472',
+    textTransform: 'uppercase',
+    letterSpacing: '2px',
+    marginBottom: '12px',
+  };
+
+  const voteBtnStyle = {
+    padding: '12px 36px',
+    color: 'white',
+    borderRadius: '8px',
+    fontWeight: '700',
+    fontSize: '16px',
+    letterSpacing: '1px',
+    textTransform: 'uppercase',
+    transition: 'transform 0.15s ease',
+    width: '100%',
+    maxWidth: '200px',
+    whiteSpace: 'nowrap',
+  };
+
+  // ── Error State ──
+  if (error) {
+    return (
+      <div style={{ minHeight: '100vh', background: '#fff', color: '#21143D', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '20px', fontFamily: "'Segoe UI', Tahoma, sans-serif" }}>
+        <div style={{ fontSize: '48px', marginBottom: '16px' }}>⚠️</div>
+        <h1 style={{ fontSize: '28px', fontWeight: 'bold', marginBottom: '12px', color: '#ef4444' }}>ERROR</h1>
+        <p style={{ color: '#6b6472', marginBottom: '24px' }}>{error}</p>
+        <button onClick={() => navigate('/student-login')} style={{ padding: '10px 24px', background: 'white', color: '#dc2626', border: 'none', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}>Login</button>
+      </div>
+    );
+  }
+
+  // ── Loading State ── (also waits for the portal clock's first answer)
+  if (loading || !portalChecked) {
+    return (
+      <div style={{ minHeight: '100vh', background: '#fff', color: '#21143D', fontFamily: "'Segoe UI', Tahoma, sans-serif", paddingBottom: '80px' }}>
+
+        {/* Greeting pill skeleton */}
+        <div style={{ display: 'flex', justifyContent: 'flex-end', width: '100%', padding: '12px 24px 0' }}>
+          <SkeletonBox style={{ height: '36px', width: '140px', borderRadius: '999px' }} />
+        </div>
+
+        {/* Header bar skeleton */}
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '16px 24px', background: '#341D61', borderBottom: '1px solid #e5e1ec' }}>
+          <SkeletonBox style={{ height: '22px', width: '200px' }} />
+          <SkeletonBox style={{ height: '34px', width: '90px' }} />
+        </div>
+
+        {/* Welcome + info bar skeletons */}
+        <div style={{ textAlign: 'center', padding: '20px 16px 8px' }}>
+          <SkeletonBox style={{ height: '16px', width: '260px', margin: '0 auto' }} />
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'center', gap: '20px', padding: '8px 16px 24px', flexWrap: 'wrap' }}>
+          <SkeletonBox style={{ height: '14px', width: '120px' }} />
+          <SkeletonBox style={{ height: '14px', width: '90px', borderRadius: '20px' }} />
+          <SkeletonBox style={{ height: '14px', width: '150px' }} />
+        </div>
+
+        {/* Ballot content skeleton */}
+        <div style={{ maxWidth: '1100px', margin: '0 auto', padding: '0 20px' }}>
+          <BallotSkeleton />
+        </div>
+
+      </div>
+    );
+  }
+
+  // ── Not Logged In ──
+  if (!student) {
+    return (
+      <div style={{ minHeight: '100vh', background: '#fff', color: '#21143D', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', fontFamily: "'Segoe UI', Tahoma, sans-serif" }}>
+        <h2 style={{ color: '#ef4444', marginBottom: '16px' }}>NOT LOGGED IN</h2>
+        <button onClick={() => navigate('/student-login')} style={{ padding: '10px 24px', background: 'white', color: '#dc2626', border: 'none', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold' }}>Login</button>
+      </div>
+    );
+  }
+
+  // ── Election Not Open ──
+  if (!isVotingOpen) {
+    return (
+      <div style={{ minHeight: '100vh', background: '#fff', color: '#21143D', fontFamily: "'Segoe UI', Tahoma, sans-serif" }}>
+
+        {/* 🌅 Greeting — top corner (added only) */}
+        <div style={{ display: 'flex', justifyContent: 'flex-end', width: '100%', padding: '12px 24px 0' }}>
+          <div style={{ background: '#eee9f5', color: '#341D61', padding: '8px 18px', borderRadius: '999px', fontWeight: '700', fontSize: '15px', boxShadow: '0 2px 10px rgba(52,29,97,0.12)' }}>
+            {getGreeting()} · {currentTime}
+          </div>
+        </div>
+
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '16px 24px', background: '#341D61', borderBottom: '1px solid #e5e1ec' }}>
+          <h2 style={{ fontSize: '20px', fontWeight: 'bold', color: '#fff' }}>SMCOAA E-VOTING</h2>
+          <button onClick={handleLogout} style={{ padding: '8px 20px', background: '#ef4444', color: 'white', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: '600' }}>Logout</button>
+        </div>
+        <hr style={{ borderColor: '#e5e1ec' }} />
+        <div style={{ textAlign: 'center', padding: '80px 20px' }}>
+          <h1 style={{ fontSize: '32px', fontWeight: '800', color: '#341D61', marginBottom: '16px' }}>{showElectionEnded ? 'ELECTION HAS ENDED' : 'ELECTION IS COMING SOON'}</h1>
+          {/* ⏳ Countdown to the start time — runs on the portal's clock, not the phone's */}
+          {countdownMs !== null && (() => {
+            const totalSeconds = Math.floor(countdownMs / 1000);
+            const parts = [
+              ['Days', Math.floor(totalSeconds / 86400)],
+              ['Hours', Math.floor((totalSeconds % 86400) / 3600)],
+              ['Minutes', Math.floor((totalSeconds % 3600) / 60)],
+              ['Seconds', totalSeconds % 60],
+            ];
+            return (
+              <div data-testid="election-countdown" style={{ margin: '4px auto 8px' }}>
+                <p style={{ color: '#6b6472', fontSize: '13px', letterSpacing: '2px', textTransform: 'uppercase', marginBottom: '12px' }}>Starts in</p>
+                <div style={{ display: 'flex', justifyContent: 'center', gap: '10px' }}>
+                  {parts.map(([label, value]) => (
+                    <div key={label} style={{ minWidth: '64px', padding: '12px 6px', background: '#fff', border: '1px solid #e5e1ec', borderRadius: '10px' }}>
+                      <div style={{ fontSize: '28px', fontWeight: '800', color: '#341D61', lineHeight: '1.1', fontVariantNumeric: 'tabular-nums' }}>{String(value).padStart(2, '0')}</div>
+                      <div style={{ fontSize: '11px', color: '#6b6472', marginTop: '4px', textTransform: 'uppercase', letterSpacing: '1px' }}>{label}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          })()}
+          <hr style={{ width: '80px', borderColor: '#341D61', margin: '20px auto' }} />
+          <p style={{ fontSize: '18px', color: '#21143D' }}>Welcome, {student.name}</p>
+          <p style={{ color: '#6b6472', marginTop: '8px' }}>{`Set of ${student.set} · S/N ${student.sn}`}</p>
+          {showSchedule && scheduleDate && (
+            <p style={{ color: '#64748b', marginTop: '16px' }}>Scheduled: {scheduleDate} at {scheduleTime || 'TBA'}</p>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // ── Voting Open ──
+  return (
+    <div style={{ minHeight: '100vh', background: '#fff', color: '#21143D', fontFamily: "'Segoe UI', Tahoma, sans-serif", paddingBottom: '80px' }}>
+
+      {/* 🌅 Greeting — top corner (added only) */}
+      <div style={{ display: 'flex', justifyContent: 'flex-end', width: '100%', padding: '12px 24px 0' }}>
+        <div style={{ background: '#eee9f5', color: '#341D61', padding: '8px 18px', borderRadius: '999px', fontWeight: '700', fontSize: '15px', boxShadow: '0 2px 10px rgba(52,29,97,0.12)' }}>
+          {getGreeting()} · {currentTime}
+        </div>
+      </div>
+
+      {/* Header */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '16px 24px', background: '#341D61', borderBottom: '1px solid #e5e1ec', position: 'sticky', top: 0, zIndex: 10 }}>
+        <h2 style={{ fontSize: '20px', fontWeight: 'bold', color: '#341D61' }}>Alumni Dashboard</h2>
+        <button onClick={handleLogout} style={{ padding: '8px 20px', background: '#ef4444', color: 'white', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: '600' }}>Logout</button>
+      </div>
+
+      {/* Student Info */}
+      <div style={{ textAlign: 'center', padding: '20px 16px 8px', color: '#21143D', fontSize: '16px' }}>
+        Welcome, <strong>{student.name}</strong> — {`Set of ${student.set} · S/N ${student.sn}`}
+      </div>
+
+      {/* Info Bar */}
+      <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '20px', padding: '8px 16px 24px', color: '#6b6472', fontSize: '14px', flexWrap: 'wrap' }}>
+        <span>Year: <strong style={{ color: '#21143D' }}>{settings.year || 'N/A'}</strong></span>
+        <span style={{ padding: '4px 14px', borderRadius: '20px', background: badge.color, color: 'white', fontWeight: '700', fontSize: '12px', letterSpacing: '1px' }}>{badge.text}</span>
+        <span>Closes: {(portal ? portal.endDate : settings.endDate) || 'N/A'} {(portal ? portal.endTime : settings.endTime) || ''}</span>
+      </div>
+
+      {/* Content */}
+      <div style={{ maxWidth: '1100px', margin: '0 auto', padding: '0 20px' }}>
+        {hasVoted ? (
+          <div style={{ textAlign: 'center', padding: '60px 20px' }}>
+            <div style={{ fontSize: '48px', marginBottom: '12px' }}>✅</div>
+            <h2 style={{ fontSize: '26px', fontWeight: 'bold', color: '#16a34a' }}>Thanks for voting. Your vote counts.</h2>
+            <div style={{ maxWidth: 900, margin: '28px auto 0', display: 'grid', gap: 18, textAlign: 'left' }}>
+              {positions.map((section) => {
+                const leader = [...section.candidates].sort((a, b) => (Number(b.votes) || 0) - (Number(a.votes) || 0))[0];
+                if (!leader) return null;
+                const unopposed = section.candidates.length === 1;
+                const total = section.candidates.reduce((sum, item) => sum + (Number(item.votes) || 0), 0);
+                const percent = unopposed ? 100 : (total > 0 ? Math.round(((Number(leader.votes) || 0) / total) * 100) : 0);
+                return <article key={section.key} style={{ background: '#fff', color: '#21143D', border: '1px solid #e5e1ec', borderRadius: 14, padding: 18 }}>
+                  <h3 style={{ margin: '0 0 14px', color: '#341D61' }}>{section.label}</h3>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
+                    {leader.photoURL && <img src={leader.photoURL} alt={leader.name} style={{ width: 76, height: 76, objectFit: 'cover', borderRadius: '50%' }} />}
+                    <div><strong>{leader.name}</strong><div style={{ display: 'flex', gap: 16, marginTop: 8 }}><span>{Number(leader.votes) || 0} votes</span><span>{percent}%</span></div></div>
+                  </div>
+                </article>;
+              })}
+            </div>
+          </div>
+        ) : candidates.length === 0 ? (
+          <div style={{ textAlign: 'center', padding: '60px 20px' }}>
+            <h3 style={{ color: '#6b6472' }}>No Candidates Available</h3>
+          </div>
+        ) : (
+          <>
+            {positions.map(section => {
+              const pos = section.key;
+              const posCandidates = section.candidates;
+              const isUnopposed = posCandidates.length === 1;
+              const posPctMap = buildPositionPercentages(posCandidates);
+              const posTotalVotes = posCandidates.reduce((s, c) => s + (c.votes || 0), 0);
+
+              return (
+              <div key={pos} style={sectionStyle}>
+
+                {/* Position Heading — Bold, Gold, On Top */}
+                <h2 style={positionHeadingStyle}>
+                  {section.label}
+                </h2>
+
+                {/* Unopposed — single candidate is automatically the winner */}
+                {isUnopposed && (
+                  <div style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    gap: '10px',
+                    marginBottom: '24px',
+                    padding: '10px 20px',
+                    background: 'linear-gradient(135deg, rgba(22,163,74,0.18), rgba(22,163,74,0.08))',
+                    border: '1px solid rgba(34,197,94,0.45)',
+                    borderRadius: '999px',
+                    color: '#4ade80',
+                    fontSize: '14px',
+                    fontWeight: '700',
+                    letterSpacing: '0.5px',
+                    textTransform: 'uppercase',
+                    boxShadow: '0 2px 12px rgba(34,197,94,0.2)',
+                  }}>
+                    🏆 Running Unopposed — Auto-Winner
+                  </div>
+                )}
+
+                {/* Candidates Grid */}
+                <div style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
+                  gap: '24px',
+                  justifyContent: 'center',
+                }}>
+                  {posCandidates.map(c => {
+                    const isSelected = selectedCandidates[pos] === c.id;
+                    const isPositionAlreadyChosen = Boolean(selectedCandidates[pos]);
+
+                    // ✅ Shows +1 preview vote for this user locally; other users only see real submitted votes
+                    const displayedVotes = (c.votes || 0) + (isSelected ? 1 : 0);
+
+                    // ✅ Percentage for this candidate in this position
+                    const pctText = posPctMap[c.id] || '0%';
+
+                    return (
+                      <div
+                        key={c.id}
+                        style={{
+                          ...cardStyle,
+                          border: isSelected ? '2px solid #22c55e' : '1px solid rgba(255,255,255,0.06)',
+                          boxShadow: isSelected ? '0 0 25px rgba(34,197,94,0.35)' : '0 4px 20px rgba(0,0,0,0.25)',
+                        }}
+                      >
+                        {/* 🏆 Winner Ribbon — unopposed auto-winner (top-left corner) */}
+                        {isUnopposed && (
+                          <div style={{
+                            position: 'absolute',
+                            top: '14px',
+                            left: '14px',
+                            background: 'linear-gradient(135deg, #16a34a, #15803d)',
+                            color: 'white',
+                            padding: '4px 10px',
+                            borderRadius: '16px',
+                            fontSize: '12px',
+                            fontWeight: '700',
+                            letterSpacing: '0.4px',
+                            boxShadow: '0 2px 10px rgba(34,197,94,0.4)',
+                          }}>
+                            🏆 WINNER
+                          </div>
+                        )}
+                        {/* Photo — top, centered */}
+                        {c.photoURL && (
+                          <img
+                            src={c.photoURL}
+                            alt={c.name}
+                            style={photoStyle}
+                            onError={(e) => { e.target.style.display = 'none'; }}
+                          />
+                        )}
+
+                        {/* Name — one line: "Chidubem Uwazie" */}
+                        <h3 style={nameStyle}>{c.name}</h3>
+
+                        <div aria-label={`${displayedVotes} votes, ${pctText}`} style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: 18, margin: '8px 0 16px', width: '100%', color: '#21143D', fontWeight: 700 }}>
+                          <span>{displayedVotes} {displayedVotes === 1 ? 'vote' : 'votes'}</span>
+                          <span>{isUnopposed ? '100%' : (posTotalVotes > 0 ? pctText : '0%')}</span>
+                        </div>
+
+                        {/* Vote Button — locked if chosen or if another candidate in this position is chosen */}
+                        <button
+                          onClick={() => handleSelectCandidate(pos, c.id)}
+                          disabled={voting || isPositionAlreadyChosen}
+                          style={{
+                            ...voteBtnStyle,
+                            background: isSelected 
+                              ? 'linear-gradient(135deg, #16a34a, #15803d)' 
+                              : isPositionAlreadyChosen 
+                                ? '#1e293b' 
+                                : 'linear-gradient(135deg, #334155, #1e293b)',
+                            border: isSelected 
+                              ? '2px solid #4ade80' 
+                              : '1px solid rgba(255,255,255,0.15)',
+                            boxShadow: isSelected ? '0 4px 15px rgba(34,197,94,0.4)' : 'none',
+                            opacity: (!isSelected && isPositionAlreadyChosen) ? 0.35 : 1,
+                            cursor: (voting || isPositionAlreadyChosen) ? 'not-allowed' : 'pointer'
+                          }}
+                        >
+                          {isSelected ? '✅ VOTED' : 'VOTE'}
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+              );
+            })}
+
+            {/* 🗳️ SUBMIT OFFICIAL BALLOT CARD */}
+            <div style={{
+              marginTop: '40px',
+              background: '#341D61',
+              padding: '28px 20px',
+              borderRadius: '16px',
+              border: '2px solid #341D61',
+              textAlign: 'center',
+              boxShadow: '0 10px 30px rgba(0,0,0,0.5)'
+            }}>
+              <h3 style={{ color: '#341D61', margin: '0 0 8px 0', fontSize: '22px' }}>🗳️ Complete & Submit Your Ballot</h3>
+              <p style={{ color: '#cbd5e1', fontSize: '14px', margin: '0 0 20px 0' }}>
+                You have voted in <strong>{Object.keys(selectedCandidates).length}</strong> of <strong>{positions.length}</strong> positions. Once submitted, your vote is final and cannot be undone.
+              </p>
+
+              <button
+                onClick={handleSubmitFinalBallot}
+                disabled={voting || Object.keys(selectedCandidates).length === 0}
+                style={{
+                  padding: '16px 40px',
+                  background: Object.keys(selectedCandidates).length === 0 ? '#475569' : 'linear-gradient(135deg, #16a34a, #15803d)',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: '10px',
+                  fontWeight: 'bold',
+                  fontSize: '18px',
+                  cursor: (voting || Object.keys(selectedCandidates).length === 0) ? 'not-allowed' : 'pointer',
+                  boxShadow: Object.keys(selectedCandidates).length === 0 ? 'none' : '0 4px 20px rgba(22,163,74,0.4)',
+                  textTransform: 'uppercase',
+                  letterSpacing: '1px',
+                  width: '100%',
+                  maxWidth: '380px'
+                }}
+              >
+                {voting ? '⏳ Submitting Votes...' : `🗳️ Submit Official Ballot (${Object.keys(selectedCandidates).length} Votes)`}
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+
+    </div>
+  );
+}

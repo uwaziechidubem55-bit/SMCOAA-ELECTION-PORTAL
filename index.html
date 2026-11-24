@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="build-version" content="3.0" />
+    <meta name="description" content="St. Michael's College, Oleh Alumni Association election portal" />
+    <meta name="keywords" content="SMCOAA, St Michael’s College Oleh, alumni election, e-voting" />
+    <meta property="og:title" content="SMCOAA Alumni Election Portal" />
+    <meta property="og:description" content="Official Election Portal for St. Michael's College, Oleh Alumni Association" />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://smcoaa-election-portal.vercel.app" />
+    <meta name="theme-color" content="#341D61" />
+
+    <!-- 🔴 UNIVERSAL INSTALL POLYFILL — Makes install work on Safari, Firefox, iOS, etc. -->
+    <script type="module" src="https://cdn.jsdelivr.net/npm/@easy-pwa/beforeinstallprompt-polyfill@1"></script>
+
+    <!-- 🔴 iOS Home Screen icon — required for Safari "Add to Home Screen" -->
+    <link rel="apple-touch-icon" href="/logo.png" />
+
+    <!-- 🔴 PWA Manifest link -->
+    <link rel="manifest" href="/manifest.json" />
+
+    <link rel="icon" type="image/png" href="/logo.png" />
+    <title>SMCOAA Alumni Election Portal | Official Election Portal</title>
+  </head>
+  <body style="background-color:#ffffff;margin:0;">
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
