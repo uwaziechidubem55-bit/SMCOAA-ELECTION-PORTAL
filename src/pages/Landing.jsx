@@ -254,11 +254,6 @@ export default function Landing() {
         Voters Access
       </Link>
 
-      <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'center', gap: 16, marginTop: 14 }}>
-        <Link to="/admin-login" style={{ color: '#341D61', fontWeight: 700, textDecoration: 'underline' }}>Admin Login</Link>
-        <Link to="/staff-login" style={{ color: '#341D61', fontWeight: 700, textDecoration: 'underline' }}>Election View</Link>
-      </div>
-
       {/* Walking marquee footer retained from the original landing layout. */}
       <div style={footerWrapperStyle}>
         <span className="footer-walker" style={{ textAlign: 'center', lineHeight: 1.5 }}>
